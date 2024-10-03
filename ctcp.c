@@ -247,15 +247,12 @@ void ctcp_read(ctcp_state_t *state) {
   // Case read EOF
   else if(byte_read == -1)
   {
+    // Update the teardown state
+    state->segment_teardown = ACTIVE_CLOSE;
     // Send FIN to close the socket
     ctcp_send_flags(state, state->conn_state.ackno, FIN);
     // Set time out flag 
     state->ack_state.time_out = true;
-    // Update the teardown state
-    state->segment_teardown = ACTIVE_CLOSE;
-    // Deallocate TX state
-    free(state->tx_state);
-    state->rx_state = NULL;
     return;
   }
   // Check if read truncated message
@@ -275,7 +272,6 @@ void ctcp_read(ctcp_state_t *state) {
       return;
     }
   }
-  
   // Send data segment over the connection
   ctcp_send_data_segment(state);
   // Update timeout condition
@@ -292,12 +288,6 @@ static void ctcp_send_flags(ctcp_state_t *state, uint32_t ackno, uint32_t flags)
   int byte_sent = 0, byte_left, segment_len; 
   segment_len = sizeof(ctcp_segment_t);
   byte_left = segment_len;
-
-  // Update the next_seqno number if not retransmission
-  if(! state->ack_state.time_out && flags == FIN)
-  {
-    state->conn_state.next_seqno = state->conn_state.seqno + 1;
-  }
 
   // Fill the ACK segment
   ctcp_segment_t* ack_segment = calloc(1, sizeof(ctcp_segment_t));
@@ -363,7 +353,6 @@ static void ctcp_receive_fin_with_no_ack(ctcp_state_t *state, ctcp_segment_t *se
   // Update the ackno of the conenction
   state->conn_state.last_ackno = state->conn_state.ackno;
   state->conn_state.ackno = ntohl(segment->seqno) + 1;
-
   // Case server passive close
   if(state->segment_teardown != ACTIVE_CLOSE)
   {
@@ -381,9 +370,8 @@ static void ctcp_receive_fin_with_no_ack(ctcp_state_t *state, ctcp_segment_t *se
     state->segment_teardown = PASSIVE_CLOSE;
   }
   // Case client receive the 2nd FIN
-  else
+  else if(state->segment_teardown == ACTIVE_CLOSE)
   {
-    // state->conn_state.seqno++;
     // Send ACK after received FIN
     ctcp_send_flags(state, state->conn_state.ackno, ACK);
     // Close the connection
@@ -449,14 +437,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len)
       {
         state->ack_state.time_out = false;
         // Deallocate tx_buffer
-        state->tx_state->buffer_size = 0;
-
-        if(state->segment_teardown != ACTIVE_CLOSE)
-        {
-          free(state->tx_state);
-          state->tx_state = NULL;
-        }
-          
+        state->tx_state->buffer_size = 0; 
         // Reset the time out counter
         state->ack_state.counter = 0;
         state->ack_state.time_out_num = 0;
@@ -477,7 +458,6 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len)
       ctcp_send_flags(state, state->conn_state.ackno, ACK);
       // Teardown the conneciton
       ctcp_destroy(state);
-
     }
     break;
 
