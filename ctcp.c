@@ -110,8 +110,8 @@ struct ctcp_state {
 
   /* FIXME: Add other needed fields. */
   Conn_state conn_state;            // Connection state
-  TX_state *tx_state;                // Transmit buffer state
-  RX_state *rx_state;                // Receive buffer state
+  TX_state *tx_state;               // Transmit buffer state
+  RX_state *rx_state;               // Receive buffer state
   ACK_state ack_state;              // Time out condition of the segment
   Teardown_state segment_teardown;  // Teardown state of the conneciton
 };
@@ -164,10 +164,10 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
   state->ack_state.counter = 0;
   state->ack_state.timer_overflow = ((cfg->rt_timeout % cfg->timer) == 0) ? (cfg->rt_timeout / cfg->timer) : (cfg->rt_timeout / cfg->timer) + 1;
 
-
   // Initiate the teardown condition
   state->segment_teardown = NO_CLOSE;
 
+  // Deallocate cfg pointer
   free(cfg);
   return state;
 }
@@ -438,6 +438,8 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len)
         state->ack_state.time_out = false;
         // Deallocate tx_buffer
         state->tx_state->buffer_size = 0; 
+        free(state->tx_state);
+        state->tx_state = NULL;
         // Reset the time out counter
         state->ack_state.counter = 0;
         state->ack_state.time_out_num = 0;
