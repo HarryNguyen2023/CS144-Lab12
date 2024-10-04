@@ -110,7 +110,7 @@ struct ctcp_state {
 
   /* FIXME: Add other needed fields. */
   Conn_state conn_state;            // Connection state
-  TX_state *tx_state;               // Transmit buffer state
+  linked_list_t *tx_state;               // Transmit buffer state
   RX_state *rx_state;               // Receive buffer state
   ACK_state ack_state;              // Time out condition of the segment
   Teardown_state segment_teardown;  // Teardown state of the conneciton
@@ -167,6 +167,9 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
   // Initiate the teardown condition
   state->segment_teardown = NO_CLOSE;
 
+  // Allocate linked list of tx state
+  state->tx_state = ll_create();
+
   // Deallocate cfg pointer
   free(cfg);
   return state;
@@ -197,27 +200,30 @@ static void ctcp_send_data_segment(ctcp_state_t *state)
   int byte_sent = 0;
   int byte_left;
 
-  // Create data segment 
-  ctcp_segment_t *data_segment = (ctcp_segment_t *)calloc(sizeof(ctcp_segment_t) + (sizeof(char) * state->tx_state->buffer_size), 1);
-  if(data_segment == NULL)
-  {
+  // Get the current head node of the linked list
+  ll_node_t* head_tx_state = ll_front(state->tx_state); 
+  if(head_tx_state == NULL)
     return;
-  }
+
+  // Create data segment to send over the conneciton
+  ctcp_segment_t *data_segment = (ctcp_segment_t *)calloc(sizeof(ctcp_segment_t) + (sizeof(char) * ((TX_state*)(head_tx_state->object))->buffer_size), 1);
+  if(data_segment == NULL)
+    return;
+
   // Update the next_seqno number if not retransmission
   if(! state->ack_state.time_out)
-  {
-    state->conn_state.next_seqno = state->conn_state.seqno + state->tx_state->buffer_size;
-  }
+    state->conn_state.next_seqno = state->conn_state.seqno + ((TX_state*)(head_tx_state->object))->buffer_size;
+
   // Fill in the data segment
   data_segment->seqno = htonl(state->conn_state.seqno);
   data_segment->ackno = htonl(state->conn_state.ackno);
-  int data_seg_len = sizeof(ctcp_segment_t) + sizeof(char) * state->tx_state->buffer_size;
+  int data_seg_len = sizeof(ctcp_segment_t) + sizeof(char) * ((TX_state*)(head_tx_state->object))->buffer_size;
   data_segment->len = htons(data_seg_len);
   data_segment->flags = htonl(0);
   data_segment->window = htons(MAX_SEG_DATA_SIZE);
 
   // Initiate data buffer
-  memcpy(data_segment->data, state->tx_state->tx_buffer, state->tx_state->buffer_size);
+  memcpy(data_segment->data, ((TX_state*)(head_tx_state->object))->tx_buffer, ((TX_state*)(head_tx_state->object))->buffer_size);
   // Checksum
   data_segment->cksum = 0;
   data_segment->cksum = cksum(data_segment, data_seg_len);
@@ -232,50 +238,58 @@ static void ctcp_send_data_segment(ctcp_state_t *state)
   free(data_segment);
 }
 
-void ctcp_read(ctcp_state_t *state) {
+void ctcp_read(ctcp_state_t *state) 
+{
+  int byte_read;
   // Initiate the buffer for reading input from user
   size_t read_len = MAX_SEG_DATA_SIZE - sizeof(ctcp_segment_t);
-  state->tx_state = (TX_state*)calloc(sizeof(TX_state) + sizeof(char) * read_len, 1);
+  char *tx_buffer = (char*)calloc(sizeof(char) * read_len, 1);
 
   // Read input from STDIN
-  int byte_read = conn_input(state->conn, state->tx_state->tx_buffer, read_len);
-  // Debugging
-  state->tx_state->buffer_size = byte_read;
-
-  if(byte_read == 0)
-    return;
-  // Case read EOF
-  else if(byte_read == -1)
+  while((byte_read = conn_input(state->conn, tx_buffer, read_len)) >= -1)
   {
-    // Update the teardown state
-    state->segment_teardown = ACTIVE_CLOSE;
-    // Send FIN to close the socket
-    ctcp_send_flags(state, state->conn_state.ackno, FIN);
-    // Set time out flag 
-    state->ack_state.time_out = true;
-    return;
-  }
-  // Check if read truncated message
-  if(byte_read > 14)
-  {
-    char truncated_buffer[15] = "\0";
-    // Copy the first 14 bytes of the reading message 
-    memcpy(truncated_buffer, state->tx_state->tx_buffer, 14);
-    truncated_buffer[14] = '\0';
-
-    // Detect if truncated message
-    if(strcmp(truncated_buffer, "###truncate###") == 0)
+    if(byte_read == 0)
+      break;
+    // Case read EOF
+    else if(byte_read == -1)
     {
-      // Ignore the message
-      free(state->tx_state);
-      state->tx_state = NULL;
-      return;
+      // Update the teardown state
+      state->segment_teardown = ACTIVE_CLOSE;
+      // Send FIN to close the socket
+      ctcp_send_flags(state, state->conn_state.ackno, FIN);
+      // Set time out flag 
+      state->ack_state.time_out = true;
+      break;
     }
+    // Check if read truncated message
+    if(byte_read > 14)
+    {
+      char truncated_buffer[15] = "\0";
+      // Copy the first 14 bytes of the reading message 
+      memcpy(truncated_buffer, tx_buffer, 14);
+      truncated_buffer[14] = '\0';
+      // Detect if truncated message
+      if(strcmp(truncated_buffer, "###truncate###") == 0)
+        break;
+    }
+    // Create the TX state object for the current segment
+    TX_state *segemnt_tx = (TX_state*)calloc(sizeof(TX_state) + sizeof(char) * read_len, 1);
+    memcpy(segemnt_tx->tx_buffer, tx_buffer, byte_read);
+    segemnt_tx->buffer_size = byte_read;
+    // Add the new TX state to the linked list
+    ll_add(state->tx_state, segemnt_tx);
   }
-  // Send data segment over the connection
-  ctcp_send_data_segment(state);
-  // Update timeout condition
-  state->ack_state.time_out = true;
+  // Deallocated the tx buffer
+  free(tx_buffer);
+  tx_buffer = NULL;
+  
+  // fprintf(stderr, "Segments length: %u\n", state->tx_state->length);
+  if(state->tx_state->length > 0)
+  {
+    ctcp_send_data_segment(state);
+    // Update timeout condition
+    state->ack_state.time_out = true;
+  }
 }
 
 /*
@@ -337,6 +351,7 @@ static void ctcp_receive_data_segment(ctcp_state_t *state, ctcp_segment_t *segme
   // Flow control if there is no space for STDOUT
   if(state->ack_state.send_ack)
   {
+    // fprintf(stderr, "Sent ack\n");
     ctcp_send_flags(state, state->conn_state.ackno, ACK);
     state->ack_state.send_ack = false;
   }
@@ -432,14 +447,19 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len)
 
     case ACK_SEG:
     {
-      // Deactivate time out flag
       if(ntohl(segment->ackno) == state->conn_state.next_seqno)
       {
+        // Deactivate time out flag
         state->ack_state.time_out = false;
-        // Deallocate tx_buffer
-        state->tx_state->buffer_size = 0; 
-        free(state->tx_state);
-        state->tx_state = NULL;
+
+        // Deallocate the head of tx state
+        ll_node_t* head_tx_state = ll_front(state->tx_state);
+        free(head_tx_state->object);
+        head_tx_state->object = NULL;
+        // Remove the tx state of the current segment
+        ll_remove(state->tx_state, head_tx_state);
+        // fprintf(stderr, "Segments length: %u\n", state->tx_state->length);
+
         // Reset the time out counter
         state->ack_state.counter = 0;
         state->ack_state.time_out_num = 0;
@@ -538,6 +558,12 @@ void ctcp_timer() {
           ctcp_send_data_segment(cur_state);
         }
       }
+    }
+    else if(cur_state->tx_state->length > 0)
+    {
+      ctcp_send_data_segment(cur_state);
+      // Update timeout condition
+      cur_state->ack_state.time_out = true;
     }
     cur_state = cur_state->next;
   }
