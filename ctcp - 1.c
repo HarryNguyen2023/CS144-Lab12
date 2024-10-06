@@ -55,6 +55,7 @@ typedef struct ACK_state
   uint8_t time_out_num;
   uint8_t counter;
   uint8_t timer_overflow;
+  bool send_ack;
   bool time_out;
 }ACK_state;
 
@@ -67,20 +68,14 @@ typedef struct Conn_state
   uint32_t next_seqno;
   uint32_t ackno;
   uint32_t last_ackno;
-  uint16_t send_window;
-  uint16_t send_window_used;
-  uint16_t rcv_window;
-  uint16_t rcv_window_used;
 }Conn_state;
 
 /*
   * Store the information of the transmit data
-  * buffer size: size of the tx buffer
-  * tx buffer: flexible array member
+  * 
 */
 typedef struct TX_state
 {
-  uint32_t segment_next_seqno;
   int buffer_size;
   char tx_buffer[];
 }TX_state;
@@ -116,7 +111,7 @@ struct ctcp_state {
   /* FIXME: Add other needed fields. */
   Conn_state conn_state;            // Connection state
   linked_list_t *tx_state;               // Transmit buffer state
-  linked_list_t *rx_state;               // Receive buffer state
+  RX_state *rx_state;               // Receive buffer state
   ACK_state ack_state;              // Time out condition of the segment
   Teardown_state segment_teardown;  // Teardown state of the conneciton
 };
@@ -130,18 +125,19 @@ static ctcp_state_t *state_list;
 /* FIXME: Feel free to add as many helper functions as needed. Don't repeat
           code! Helper functions make the code clearer and cleaner. */
 
+
 /******************************* Helper function prototypes *********************************/
 static void ctcp_send_flags(ctcp_state_t *state, uint32_t ackno, uint32_t flags);
 static void ctcp_receive_data_segment(ctcp_state_t *state, ctcp_segment_t *segment, size_t len);
 static void ctcp_receive_fin_with_no_ack(ctcp_state_t *state, ctcp_segment_t *segment);
-static void ctcp_send_data_segment(ctcp_state_t *state, ll_node_t *tx_state_node);
-static void ctcp_send_possible_data_segment(ctcp_state_t *state);
+static void ctcp_send_data_segment(ctcp_state_t *state);
 
 ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
   /* Connection could not be established. */
   if (conn == NULL) {
     return NULL;
   }
+
   /* Established a connection. Create a new state and update the linked list
      of connection states. */
   ctcp_state_t *state = calloc(sizeof(ctcp_state_t), 1);
@@ -150,28 +146,29 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
   if (state_list)
     state_list->prev = &state->next;
   state_list = state;
+
   /* Set fields. */
   state->conn = conn;
+  /* FIXME: Do any other initialization here. */
+
   // Set connection state
   state->conn_state.seqno = 1;
   state->conn_state.next_seqno = 1;
   state->conn_state.ackno = 1;
   state->conn_state.last_ackno = 1;
-  state->conn_state.send_window = cfg->send_window;
-  state->conn_state.send_window_used = 0;
-  state->conn_state.rcv_window = cfg->recv_window;
-  state->conn_state.rcv_window_used = 0;
 
   // Initiate the segment ACK
+  state->ack_state.send_ack = false;
   state->ack_state.time_out = false;
   state->ack_state.time_out_num = 0;
   state->ack_state.counter = 0;
   state->ack_state.timer_overflow = ((cfg->rt_timeout % cfg->timer) == 0) ? (cfg->rt_timeout / cfg->timer) : (cfg->rt_timeout / cfg->timer) + 1;
+
   // Initiate the teardown condition
   state->segment_teardown = NO_CLOSE;
-  // Allocate linked list of tx state & rx_state
+
+  // Allocate linked list of tx state
   state->tx_state = ll_create();
-  state->rx_state = ll_create();
 
   // Deallocate cfg pointer
   free(cfg);
@@ -186,9 +183,7 @@ void ctcp_destroy(ctcp_state_t *state) {
   *state->prev = state->next;
   conn_remove(state->conn);
 
-  // Destroy the 2 linked list inside the state
-  ll_destroy(state->tx_state);
-  ll_destroy(state->rx_state);
+  /* FIXME: Do any other cleanup here. */
 
   free(state);
   state = NULL;
@@ -200,34 +195,39 @@ void ctcp_destroy(ctcp_state_t *state) {
   * Param state: state of the current connection
   * Param data_buffer: data need to be transmitted over the connection
 */
-static void ctcp_send_data_segment(ctcp_state_t *state, ll_node_t *tx_state_node)
+static void ctcp_send_data_segment(ctcp_state_t *state)
 {
-  // Get the current head node of the linked list
-  if(tx_state_node == NULL)
-    return;
-  // Initiate some variables
   int byte_sent = 0;
   int byte_left;
+
+  // Get the current head node of the linked list
+  ll_node_t* head_tx_state = ll_front(state->tx_state); 
+  if(head_tx_state == NULL)
+    return;
+
   // Create data segment to send over the conneciton
-  ctcp_segment_t *data_segment = (ctcp_segment_t *)calloc(sizeof(ctcp_segment_t) + (sizeof(char) * ((TX_state*)(tx_state_node->object))->buffer_size), 1);
+  ctcp_segment_t *data_segment = (ctcp_segment_t *)calloc(sizeof(ctcp_segment_t) + (sizeof(char) * ((TX_state*)(head_tx_state->object))->buffer_size), 1);
   if(data_segment == NULL)
     return;
-  // Fill in the data segment
-  data_segment->seqno = htonl(state->conn_state.next_seqno);
-  data_segment->ackno = htonl(state->conn_state.ackno);
-  // Update the next_seqno number if not retransmission
-  state->conn_state.next_seqno += ((TX_state*)(tx_state_node->object))->buffer_size;
-  ((TX_state*)(tx_state_node->object))->segment_next_seqno = state->conn_state.next_seqno;
 
-  int data_seg_len = sizeof(ctcp_segment_t) + sizeof(char) * ((TX_state*)(tx_state_node->object))->buffer_size;
+  // Update the next_seqno number if not retransmission
+  if(! state->ack_state.time_out)
+    state->conn_state.next_seqno = state->conn_state.seqno + ((TX_state*)(head_tx_state->object))->buffer_size;
+
+  // Fill in the data segment
+  data_segment->seqno = htonl(state->conn_state.seqno);
+  data_segment->ackno = htonl(state->conn_state.ackno);
+  int data_seg_len = sizeof(ctcp_segment_t) + sizeof(char) * ((TX_state*)(head_tx_state->object))->buffer_size;
   data_segment->len = htons(data_seg_len);
   data_segment->flags = htonl(0);
-  data_segment->window = htons(MAX_SEG_DATA_SIZE * ((state->conn_state.rcv_window - state->conn_state.rcv_window_used) / MAX_SEG_DATA_SIZE));
+  data_segment->window = htons(MAX_SEG_DATA_SIZE);
+
   // Initiate data buffer
-  memcpy(data_segment->data, ((TX_state*)(tx_state_node->object))->tx_buffer, ((TX_state*)(tx_state_node->object))->buffer_size);
+  memcpy(data_segment->data, ((TX_state*)(head_tx_state->object))->tx_buffer, ((TX_state*)(head_tx_state->object))->buffer_size);
   // Checksum
   data_segment->cksum = 0;
   data_segment->cksum = cksum(data_segment, data_seg_len);
+
   byte_left = data_seg_len;
   // Send the data over the connection
   while(byte_left > 0)
@@ -235,45 +235,14 @@ static void ctcp_send_data_segment(ctcp_state_t *state, ll_node_t *tx_state_node
     byte_sent = conn_send(state->conn, data_segment + data_seg_len - byte_left, byte_left);
     byte_left -= byte_sent;
   }
-  // Set time out flag 
-  state->ack_state.time_out = true;
   free(data_segment);
-}
-
-/*
-  @brief: Function to send all the possible sending sliding window over the conneciton using Go Back N technique
-  @param state: state of the current connection
-  @param tx_start_node: the start node contain data to be sent of the sliding window
-  @return value: none
-*/
-static void ctcp_send_possible_data_segment(ctcp_state_t *state)
-{
-  // Initiate the sending window used of the connection 
-  state->conn_state.send_window_used = 0;
-  // Update the next_seqno number of the connection
-  state->conn_state.next_seqno = state->conn_state.seqno;
-  // Send data over the connetion
-  ll_node_t* tx_state_node = ll_front(state->tx_state);
-  // Send the whole sending window size
-  while(tx_state_node != NULL)
-  {
-    // Check if we have send the whole sending window size
-    if(((TX_state*)(tx_state_node->object))->buffer_size + state->conn_state.send_window_used > state->conn_state.send_window)
-      break;
-    // Send out the sending window of the data segment
-    ctcp_send_data_segment(state, tx_state_node);
-    // Update the used window size 
-    state->conn_state.send_window_used += ((TX_state*)(tx_state_node->object))->buffer_size;
-    // Move to the next segment
-    tx_state_node = tx_state_node->next;
-  }
 }
 
 void ctcp_read(ctcp_state_t *state) 
 {
-  int byte_read = 0;
+  int byte_read;
   // Initiate the buffer for reading input from user
-  size_t read_len = MAX_SEG_DATA_SIZE;
+  size_t read_len = MAX_SEG_DATA_SIZE - sizeof(ctcp_segment_t);
   char *tx_buffer = (char*)calloc(sizeof(char) * read_len, 1);
 
   // Read input from STDIN
@@ -284,10 +253,6 @@ void ctcp_read(ctcp_state_t *state)
     // Case read EOF
     else if(byte_read == -1)
     {
-      // Send out all of the data to STDOUT
-      while(state->rx_state->length > 0);
-      // Send all read data over the connection
-      while(state->tx_state->length > 0);
       // Update the teardown state
       state->segment_teardown = ACTIVE_CLOSE;
       // Send FIN to close the socket
@@ -308,18 +273,23 @@ void ctcp_read(ctcp_state_t *state)
         break;
     }
     // Create the TX state object for the current segment
-    TX_state *segemnt_tx = (TX_state*)calloc(sizeof(TX_state) + sizeof(char) * byte_read, 1);
+    TX_state *segemnt_tx = (TX_state*)calloc(sizeof(TX_state) + sizeof(char) * read_len, 1);
     memcpy(segemnt_tx->tx_buffer, tx_buffer, byte_read);
     segemnt_tx->buffer_size = byte_read;
-    
     // Add the new TX state to the linked list
     ll_add(state->tx_state, segemnt_tx);
   }
   // Deallocated the tx buffer
   free(tx_buffer);
   tx_buffer = NULL;
-  // Send all possisble data segment of the sliding window
-  ctcp_send_possible_data_segment(state);
+  
+  // fprintf(stderr, "Segments length: %u\n", state->tx_state->length);
+  if(state->tx_state->length > 0)
+  {
+    ctcp_send_data_segment(state);
+    // Update timeout condition
+    state->ack_state.time_out = true;
+  }
 }
 
 /*
@@ -339,8 +309,8 @@ static void ctcp_send_flags(ctcp_state_t *state, uint32_t ackno, uint32_t flags)
   ack_segment->ackno = htonl(ackno);
   ack_segment->len = htons(segment_len);
   ack_segment->flags |= htonl(flags);
-  // ack_segment->window = htons(MAX_SEG_DATA_SIZE * ((state->conn_state.rcv_window - state->conn_state.rcv_window_used) / MAX_SEG_DATA_SIZE));
-  ack_segment->window = htons(MAX_SEG_DATA_SIZE * ((state->conn_state.rcv_window - state->conn_state.rcv_window_used) / MAX_SEG_DATA_SIZE));
+  ack_segment->window = htons(MAX_SEG_DATA_SIZE);
+
   // Get the checksum number of the segment
   ack_segment->cksum = 0;
   ack_segment->cksum = cksum(ack_segment, segment_len);
@@ -365,26 +335,26 @@ static void ctcp_receive_data_segment(ctcp_state_t *state, ctcp_segment_t *segme
 {
   // Get the actual data length
   int data_seg_len = len - sizeof(ctcp_segment_t);
-  // Add new data segment into the receive sliding window
-  if(state->conn_state.rcv_window_used + data_seg_len <= state->conn_state.rcv_window)
-  {
-    // Update the ACK number of the connection
-    state->conn_state.last_ackno = state->conn_state.ackno;
-    state->conn_state.ackno = ntohl(segment->seqno) + ntohs(segment->len) - sizeof(ctcp_segment_t);
+  // Update the ACK number of the connection
+  state->conn_state.last_ackno = state->conn_state.ackno;
+  state->conn_state.ackno = ntohl(segment->seqno) + ntohs(segment->len) - sizeof(ctcp_segment_t);
 
-    // Copy segment data into the node buffer
-    RX_state* rx_state_node = (RX_state*)calloc(sizeof(RX_state) + sizeof(char) * data_seg_len, 1);
-    memcpy(rx_state_node->rx_buffer, segment->data, data_seg_len);
-    rx_state_node->byte_left = data_seg_len;
-    rx_state_node->byte_used = 0;
+  // Copy the data to buffer
+  state->rx_state = (RX_state*)calloc(sizeof(RX_state) + sizeof(char) * data_seg_len, 1);
+  memcpy(state->rx_state->rx_buffer, segment->data, data_seg_len);
+  state->rx_state->byte_left = data_seg_len;
+  state->rx_state->byte_used = 0;
 
-    // Update the used received window size
-    state->conn_state.rcv_window_used += data_seg_len;
-    // Add segment node into the sliding window
-    ll_add(state->rx_state, rx_state_node);
-  }
   // Output data to STDOUT
   ctcp_output(state);
+
+  // Flow control if there is no space for STDOUT
+  if(state->ack_state.send_ack)
+  {
+    // fprintf(stderr, "Sent ack\n");
+    ctcp_send_flags(state, state->conn_state.ackno, ACK);
+    state->ack_state.send_ack = false;
+  }
 }
 
 /*
@@ -406,7 +376,7 @@ static void ctcp_receive_fin_with_no_ack(ctcp_state_t *state, ctcp_segment_t *se
     // Send ACK after received FIN
     ctcp_send_flags(state, state->conn_state.ackno, ACK);
     // Send out all of the data to STDOUT
-    while(state->rx_state->length > 0);
+    while(state->rx_state != NULL);
     // Send FIN back
     ctcp_send_flags(state, state->conn_state.ackno, FIN);
     // Raise timeout flag 
@@ -434,7 +404,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len)
     free(segment);
     return;
   }
-  // Discard truncated received segment
+  // Truncated received segment
   else if(len != ntohs(segment->len))
   {
     free(segment);
@@ -477,47 +447,28 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len)
 
     case ACK_SEG:
     {
-      // Teardown the connection if this is the last ACK
-      if(state->segment_teardown == PASSIVE_CLOSE)
+      if(ntohl(segment->ackno) == state->conn_state.next_seqno)
       {
-        ctcp_destroy(state);
-        return; 
-      }
-      ll_node_t* tx_state_node = ll_front(state->tx_state);
-      if(tx_state_node == NULL)
-        return;
-      uint32_t next_seqno = ((TX_state*)(tx_state_node->object))->segment_next_seqno;
-      uint32_t segment_ackno = ntohl(segment->ackno);
-      // Handle cummulative acknowledgement
-      if(segment_ackno >= next_seqno)
-      {
-        while(segment_ackno >= ((TX_state*)(tx_state_node->object))->segment_next_seqno && ((TX_state*)(tx_state_node->object))->segment_next_seqno > 0)
-        {
-          // Update sequence number
-          state->conn_state.seqno = ((TX_state*)(tx_state_node->object))->segment_next_seqno;
-          // Update the used sending window size
-          state->conn_state.send_window_used -= ((TX_state*)(tx_state_node->object))->buffer_size;
-          // Deallocate the head of tx state
-          free(tx_state_node->object);
-          tx_state_node->object = NULL;
-          // Move to the next node and delete the head node of the linked list
-          if(tx_state_node->next != NULL)
-            tx_state_node = tx_state_node->next;
-          else
-          {
-            ll_remove(state->tx_state, ll_front(state->tx_state));
-            break;
-          }
-          ll_remove(state->tx_state, ll_front(state->tx_state));
-        }
         // Deactivate time out flag
-        if(segment_ackno == state->conn_state.next_seqno)
-          state->ack_state.time_out = false;
+        state->ack_state.time_out = false;
+
+        // Deallocate the head of tx state
+        ll_node_t* head_tx_state = ll_front(state->tx_state);
+        free(head_tx_state->object);
+        head_tx_state->object = NULL;
+        // Remove the tx state of the current segment
+        ll_remove(state->tx_state, head_tx_state);
+        // fprintf(stderr, "Segments length: %u\n", state->tx_state->length);
+
         // Reset the time out counter
         state->ack_state.counter = 0;
-        state->ack_state.time_out_num = 0; 
+        state->ack_state.time_out_num = 0;
+        // Update sequence number
+        state->conn_state.seqno = state->conn_state.next_seqno;
       }
-      
+      // Teardown the connection if this is the last ACK
+      if(state->segment_teardown == PASSIVE_CLOSE)
+        ctcp_destroy(state); 
     }
     break;
 
@@ -548,42 +499,23 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len)
 }
 
 void ctcp_output(ctcp_state_t *state) {
-  // Get the head of the receive sliding window
-  ll_node_t* rx_state_node = ll_front(state->rx_state);
-  if(rx_state_node == NULL)
+  // Get the available space to be output
+  size_t avai_space = conn_bufspace(state->conn);
+  if(! avai_space)
     return;
 
-  // Check if there is enough available space to output to STDOUT
-  while(rx_state_node != NULL)
+  // Actually output the buffer to the STDOUT
+  int byte_sent = conn_output(state->conn, (state->rx_state->rx_buffer + state->rx_state->byte_used), state->rx_state->byte_left);
+  // Update the RX state of the connection
+  state->rx_state->byte_used += byte_sent;
+  state->rx_state->byte_left -= byte_sent;
+
+  // Flow control and deallocation of buffer
+  if(state->rx_state->byte_left <= 0)
   {
-    // Get the availabe space
-    size_t avai_space = conn_bufspace(state->conn);
-    if(! avai_space || ((RX_state*)(rx_state_node->object))->byte_left > avai_space)
-      break;
-    
-    // Actually output the buffer to the STDOUT
-    int byte_sent = conn_output(state->conn, (((RX_state*)(rx_state_node->object))->rx_buffer + ((RX_state*)(rx_state_node->object))->byte_used), ((RX_state*)(rx_state_node->object))->byte_left);
-    // Update the RX state of the connection
-    ((RX_state*)(rx_state_node->object))->byte_used += byte_sent;
-    ((RX_state*)(rx_state_node->object))->byte_left -= byte_sent;
-    // Update the receive window used
-    state->conn_state.rcv_window_used -= byte_sent;
-
-    // Flow control and deallocation of buffer
-    if(((RX_state*)(rx_state_node->object))->byte_left <= 0)
-    {
-      // Send out ACK for the buffer
-      ctcp_send_flags(state, state->conn_state.ackno, ACK);
-      // Deallocate buffer for the rx state node
-      free(rx_state_node->object);
-      rx_state_node->object = NULL;
-    }
-    else
-      break;
-
-    rx_state_node = rx_state_node->next;
-    // Delete the last node
-    ll_remove(state->rx_state, ll_front(state->rx_state));
+    state->ack_state.send_ack = true;
+    free(state->rx_state);
+    state->rx_state = NULL;
   }
 }
 
@@ -591,6 +523,7 @@ void ctcp_timer() {
   // Verify the existence of state list 
   if(state_list == NULL)
     return;
+
   // Get the head of the state list
   ctcp_state_t *cur_state = state_list;
   // Traverse the state linked list
@@ -602,7 +535,7 @@ void ctcp_timer() {
       if(++(cur_state->ack_state.counter) == cur_state->ack_state.timer_overflow)
       {
         cur_state->ack_state.counter = 0;
-        // Teardown connection at the 6th time out
+        // Teardown connection 
         if(++(cur_state->ack_state.time_out_num) == 6)
         {
           // Send FIN
@@ -622,20 +555,15 @@ void ctcp_timer() {
         }
         else if(cur_state->segment_teardown == NO_CLOSE)
         {
-          // Retrnasmit all the unacked data segment + new data segment of the sliding window
-          ctcp_send_possible_data_segment(cur_state);
+          ctcp_send_data_segment(cur_state);
         }
       }
     }
-    else 
+    else if(cur_state->tx_state->length > 0)
     {
-      // Send the left data segments
-      ctcp_send_possible_data_segment(cur_state);
-      // Send out of received data segment to STDOUT
-      if(cur_state->rx_state->length > 0)
-      {
-        ctcp_output(cur_state);
-      }
+      ctcp_send_data_segment(cur_state);
+      // Update timeout condition
+      cur_state->ack_state.time_out = true;
     }
     cur_state = cur_state->next;
   }
